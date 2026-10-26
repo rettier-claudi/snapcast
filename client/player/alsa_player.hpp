@@ -20,6 +20,7 @@
 
 // local headers
 #include "player.hpp"
+#include "ref_output.hpp"
 
 // 3rd party headers
 #include <alsa/asoundlib.h>
@@ -84,6 +85,7 @@ private:
     std::unique_ptr<pollfd, std::function<void(pollfd*)>> fd_;
     std::vector<char> buffer_;
     snd_pcm_uframes_t frames_;
+    std::unique_ptr<RefOutput> ref_;
     boost::asio::posix::stream_descriptor sd_;
     std::chrono::time_point<std::chrono::steady_clock> last_change_;
     std::recursive_mutex rec_mutex_;

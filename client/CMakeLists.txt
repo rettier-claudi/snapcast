@@ -50,7 +50,7 @@ elseif(NOT ANDROID)
 
   # ALSA
   if(ALSA_FOUND)
-    list(APPEND CLIENT_SOURCES player/alsa_player.cpp)
+    list(APPEND CLIENT_SOURCES player/alsa_player.cpp player/ref_output.cpp)
     list(APPEND CLIENT_LIBRARIES ${ALSA_LIBRARIES})
     include_directories(${ALSA_INCLUDE_DIRS})
   endif(ALSA_FOUND)

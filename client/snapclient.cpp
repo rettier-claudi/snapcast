@@ -150,6 +150,12 @@ int main(int argc, char** argv)
         /*auto latencyValue =*/op.add<Value<int>>("", "latency", "latency of the PCM device", 0, &settings.player.latency);
 #ifdef HAS_SOXR
         auto sample_format = op.add<Value<string>>("", "sampleformat", "resample audio stream to <rate>:<bits>:<channels>", "");
+        op.add<Value<string>>("", "ref-soundcard", "ALSA device for a second output that follows the main one sample by sample (echo canceller reference)", "",
+                              &settings.player.reference.pcm);
+        op.add<Value<uint32_t>>("", "ref-rate", "sample rate of the reference output", 16000, &settings.player.reference.rate);
+        op.add<Value<uint32_t>>("", "ref-channels", "channels of the reference output (all get the mono mix)", 2, &settings.player.reference.channels);
+        op.add<Value<int>>("", "ref-offset", "reference is heard this many microseconds after the main output", 0, &settings.player.reference.offset_us);
+        op.add<Value<int>>("", "ref-buffer", "ALSA buffer of the reference output in ms", 60, &settings.player.reference.buffer_ms);
 #endif
 
         auto supported_players = Controller::getSupportedPlayerNames();

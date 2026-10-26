@@ -65,6 +65,15 @@ struct ClientSettings
         SampleFormat sample_format;
         SharingMode sharing_mode{SharingMode::unspecified};
         Mixer mixer;
+        /// Second output that follows this one sample by sample (echo canceller reference), ALSA only
+        struct Reference
+        {
+            std::string pcm{""};       ///< empty: off
+            uint32_t rate{16000};
+            uint32_t channels{2};
+            int offset_us{0};
+            int buffer_ms{60};
+        } reference;
     };
 
     struct Logging

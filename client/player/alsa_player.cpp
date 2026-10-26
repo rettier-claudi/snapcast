@@ -500,6 +500,17 @@ void AlsaPlayer::uninitMixer()
 
 void AlsaPlayer::start()
 {
+    if (!settings_.reference.pcm.empty() && !ref_)
+    {
+        RefOutput::Settings rs;
+        rs.pcm = settings_.reference.pcm;
+        rs.rate = settings_.reference.rate;
+        rs.channels = settings_.reference.channels;
+        rs.offset = chrono::microseconds(settings_.reference.offset_us);
+        rs.buffer = chrono::milliseconds(settings_.reference.buffer_ms);
+        ref_ = std::make_unique<RefOutput>(rs);
+        ref_->start();
+    }
     try
     {
         initAlsa();
@@ -526,6 +537,8 @@ void AlsaPlayer::stop()
 {
     Player::stop();
     uninitAlsa(true);
+    if (ref_)
+        ref_->stop();
 }
 
 
@@ -638,9 +651,13 @@ void AlsaPlayer::worker()
             LOG(DEBUG, LOG_TAG) << "Resizing buffer from " << buffer_.size() << " to " << framesAvail * format.frameSize() << "\n";
             buffer_.resize(framesAvail * format.frameSize());
         }
+        auto play_time = std::chrono::steady_clock::now() + delay;
         if (stream_->getPlayerChunk(buffer_.data(), delay, framesAvail))
         {
             lastChunkTick = chronos::getTickCount();
+            // the reference gets the samples before the volume: it stays full level like a second client with --mixer none
+            if (ref_)
+                ref_->push(buffer_.data(), framesAvail, format, play_time);
             adjustVolume(buffer_.data(), framesAvail);
             if ((pcm = snd_pcm_writei(handle_, buffer_.data(), framesAvail)) == -EPIPE)
             {
