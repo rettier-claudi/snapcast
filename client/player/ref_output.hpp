@@ -23,7 +23,6 @@
 
 // 3rd party headers
 #include <alsa/asoundlib.h>
-#include <soxr.h>
 
 // standard headers
 #include <atomic>
@@ -46,11 +45,11 @@ namespace player
 /// microphone array): it gets exactly the samples the main output plays, with a
 /// fixed time offset, instead of syncing to the server on its own. The main
 /// player hands over each block together with the time its first sample is
-/// heard. A worker thread writes the blocks to the reference device, converts
-/// to its rate with soxr (fixed ratio, constant delay) and keeps the reference at
-/// "main output time + offset" by dropping or repeating single input frames at the
-/// rate a PI controller asks for. Two sound cards on different clocks are fine; on
-/// the same clock nothing is dropped.
+/// heard. A worker thread converts to the reference rate with its own windowed-sinc
+/// resampler (centred, so no added delay) and writes to the reference device. A PI
+/// controller trims the resampling step so the reference is heard at "main output
+/// time + offset". Two sound cards on different clocks are fine; on the same clock
+/// the step settles at nominal.
 class RefOutput
 {
 public:
@@ -60,7 +59,7 @@ public:
         uint32_t rate{16000};                        ///< sample rate of the reference device
         uint32_t channels{2};                        ///< channels of the reference device (mono mix on all)
         std::chrono::microseconds offset{0};         ///< reference is heard this much after the main output
-        std::chrono::microseconds buffer{60000};     ///< ALSA buffer of the reference device
+        std::chrono::microseconds buffer{40000};     ///< ALSA buffer of the reference device
         std::chrono::microseconds max_error{20000};  ///< beyond this, realign hard
     };
 
@@ -86,7 +85,8 @@ private:
     void worker();
     bool openPcm();
     void closePcm();
-    void resetResampler(uint32_t in_rate);
+    void resetInput(uint32_t in_rate);
+    float sample(double pos) const;
     void writeOutput(const std::vector<float>& mono, size_t frames);
     void writeSilence(size_t frames);
     void realign(clock::time_point now, snd_pcm_sframes_t delay);
@@ -102,17 +102,17 @@ private:
 
     // worker state
     snd_pcm_t* pcm_{nullptr};
-    soxr_t soxr_{nullptr};
     uint32_t in_rate_{0};
-    std::vector<float> in_;           ///< mono input not yet given to the resampler
-    clock::time_point in_time_;       ///< main output play time of in_[0]
+    std::vector<float> in_;           ///< mono input; in_[0] is heard on the main output at in_time_
+    clock::time_point in_time_;
+    double pos_{0.0};                 ///< input position of the next output frame
+    std::vector<float> kernel_;       ///< windowed sinc, PHASES x TAPS
     bool aligned_{false};
+    bool fine_pending_{false};
     double integral_{0.0};
     double ratio_corr_{0.0};
     double err_avg_{0.0};
-    double acc_{0.0};
-    size_t dropped_{0};
-    size_t repeated_{0};
+    clock::time_point aligned_at_;
     clock::time_point last_data_;
     clock::time_point last_stats_;
     size_t realigns_{0};

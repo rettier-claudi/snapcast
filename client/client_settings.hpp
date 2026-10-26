@@ -72,7 +72,7 @@ struct ClientSettings
             uint32_t rate{16000};
             uint32_t channels{2};
             int offset_us{0};
-            int buffer_ms{60};
+            int buffer_ms{40};
         } reference;
     };
 

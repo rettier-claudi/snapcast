@@ -37,18 +37,27 @@ static constexpr auto LOG_TAG = "RefOutput";
 
 namespace
 {
-// Rate control: error in seconds -> relative rate correction, applied by dropping or
-// repeating input frames. Time constant ~10 s: a card 140 ppm off is caught, period
-// jitter of the delay readings stays out.
+// Rate control: error in seconds -> relative step correction. Time constant ~10 s: a card
+// 140 ppm off is caught, the jitter of the delay readings stays out.
 constexpr double KP = 0.05;
 constexpr double KI = 0.005;
 constexpr double MAX_CORR = 1e-3;   // +-1000 ppm
 constexpr double ERR_SMOOTH = 0.02; // EMA of the measured error per write
 constexpr auto IDLE_CLOSE = 5s;     // like the main ALSA player: close after 5 s without data
 
+// Resampler: windowed sinc, centred on the output position (no delay, needs TAPS/2 input ahead)
+constexpr int TAPS = 64;
+constexpr int PHASES = 512;
+constexpr int HALF = TAPS / 2;
+
 double seconds(chrono::steady_clock::duration d)
 {
     return chrono::duration<double>(d).count();
+}
+
+chrono::steady_clock::duration duration(double s)
+{
+    return chrono::duration_cast<chrono::steady_clock::duration>(chrono::duration<double>(s));
 }
 } // namespace
 
@@ -86,11 +95,6 @@ void RefOutput::stop()
     if (thread_.joinable())
         thread_.join();
     closePcm();
-    if (soxr_ != nullptr)
-    {
-        soxr_delete(soxr_);
-        soxr_ = nullptr;
-    }
 }
 
 
@@ -117,7 +121,7 @@ void RefOutput::push(const char* data, size_t frames, const SampleFormat& format
     }
     else if (format.sampleSize() == 4)
     {
-        // 24 bit samples are carried in 32 bit, left aligned to bit 23 (snapcast convention)
+        // 24 bit samples are carried in 32 bit (snapcast convention)
         const auto* in = reinterpret_cast<const int32_t*>(data);
         const float full = (format.bits() == 24) ? 8388608.f : 2147483648.f;
         for (size_t f = 0; f < frames; ++f)
@@ -139,8 +143,7 @@ void RefOutput::push(const char* data, size_t frames, const SampleFormat& format
     {
         std::lock_guard<std::mutex> lock(mutex_);
         queue_.push_back(std::move(block));
-        // never hold more than ~2 s (main output paused without us noticing)
-        while (queue_.size() > 400)
+        while (queue_.size() > 400) // never more than ~2 s
             queue_.pop_front();
     }
     cv_.notify_one();
@@ -176,6 +179,8 @@ bool RefOutput::openPcm()
     {
         LOG(WARNING, LOG_TAG) << settings_.pcm << " runs at " << rate << " Hz instead of " << settings_.rate << "\n";
         settings_.rate = rate;
+        if (in_rate_ != 0)
+            resetInput(in_rate_);
     }
     snd_pcm_prepare(pcm_);
     LOG(INFO, LOG_TAG) << "Opened " << settings_.pcm << ": " << rate << " Hz, buffer " << buffer_time << " us, period " << period_time << " us\n";
@@ -195,26 +200,50 @@ void RefOutput::closePcm()
 }
 
 
-void RefOutput::resetResampler(uint32_t in_rate)
+/// New input rate: build the kernel (low pass just below the reference's Nyquist) and drop the input.
+void RefOutput::resetInput(uint32_t in_rate)
 {
-    if (soxr_ != nullptr)
-        soxr_delete(soxr_);
-    soxr_error_t error;
-    // fixed ratio: its delay is constant and reported exactly by soxr_delay, the drift is
-    // handled by dropping or repeating single input frames (see worker)
-    soxr_quality_spec_t q = soxr_quality_spec(SOXR_HQ, 0);
-    soxr_io_spec_t io = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
-    soxr_ = soxr_create(in_rate, settings_.rate, 1, &error, &io, &q, nullptr);
-    if (error != nullptr)
-    {
-        LOG(ERROR, LOG_TAG) << "soxr_create: " << error << "\n";
-        soxr_ = nullptr;
-        return;
-    }
     in_rate_ = in_rate;
+    in_.clear();
+    pos_ = HALF;
+    aligned_ = false;
     integral_ = 0;
     ratio_corr_ = 0;
-    acc_ = 0;
+    // cutoff 0.45 * output rate (or 0.45 * input rate when upsampling), relative to the input rate
+    double fc = 2.0 * 0.45 * std::min(settings_.rate, in_rate_) / in_rate_;
+    kernel_.assign(static_cast<size_t>(PHASES) * TAPS, 0.f);
+    for (int ph = 0; ph < PHASES; ++ph)
+    {
+        double frac = static_cast<double>(ph) / PHASES;
+        double sum = 0;
+        for (int k = 0; k < TAPS; ++k)
+        {
+            double x = (k - (HALF - 1)) - frac; // distance from the output position, in input frames
+            double sinc = (std::abs(x) < 1e-9) ? 1.0 : std::sin(M_PI * fc * x) / (M_PI * fc * x);
+            double t = x / HALF;                 // -1..1 over the span
+            double w = (std::abs(t) >= 1.0) ? 0.0 : 0.42 + 0.5 * std::cos(M_PI * t) + 0.08 * std::cos(2 * M_PI * t);
+            kernel_[static_cast<size_t>(ph * TAPS + k)] = static_cast<float>(fc * sinc * w);
+            sum += fc * sinc * w;
+        }
+        for (int k = 0; k < TAPS; ++k) // unity gain at DC for every phase
+            kernel_[static_cast<size_t>(ph * TAPS + k)] = static_cast<float>(kernel_[static_cast<size_t>(ph * TAPS + k)] / sum);
+    }
+    LOG(DEBUG, LOG_TAG) << "Resampler " << in_rate_ << " -> " << settings_.rate << " Hz, " << TAPS << " taps, cutoff " << fc * in_rate_ / 2 << " Hz\n";
+}
+
+
+/// Output value at input position pos (needs in_[pos - HALF + 1 .. pos + HALF]).
+float RefOutput::sample(double pos) const
+{
+    auto i = static_cast<long>(std::floor(pos));
+    double frac = pos - static_cast<double>(i);
+    int ph = std::min(PHASES - 1, static_cast<int>(frac * PHASES));
+    const float* h = &kernel_[static_cast<size_t>(ph * TAPS)];
+    const float* x = &in_[static_cast<size_t>(i - (HALF - 1))];
+    float y = 0;
+    for (int k = 0; k < TAPS; ++k)
+        y += x[k] * h[k];
+    return y;
 }
 
 
@@ -257,38 +286,42 @@ void RefOutput::writeSilence(size_t frames)
 }
 
 
-/// Drop or pad input so that the next frame written is heard at main time + offset.
+/// Set the input position so that the next frame written is heard at main time + offset.
 void RefOutput::realign(clock::time_point now, snd_pcm_sframes_t delay)
 {
     ++realigns_;
-    if (soxr_ != nullptr)
-        soxr_clear(soxr_);
-    integral_ = 0;
-    ratio_corr_ = 0;
+    // keep the learned rate (integral_): the clocks did not change, only the position did
     err_avg_ = 0;
-    acc_ = 0;
-    // the next written frame is heard at:
-    auto t_out = now + chrono::duration_cast<clock::duration>(chrono::duration<double>(static_cast<double>(delay) / settings_.rate));
-    // resampler group delay, in input time
-    double group = (soxr_ != nullptr) ? soxr_delay(soxr_) / settings_.rate : 0.;
-    // input sample that belongs there (main time of in_[0] is in_time_)
-    double skip = (seconds(t_out - in_time_) - seconds(settings_.offset) + group) * in_rate_;
-    if (skip >= 0)
+    aligned_at_ = now;
+    double t_out = static_cast<double>(delay) / settings_.rate; // next written frame heard in t_out
+    double t_in = seconds(in_time_ - now);                      // in_[0] heard on the main output in t_in
+    double p = (t_out - seconds(settings_.offset) - t_in) * in_rate_;
+    LOG(DEBUG, LOG_TAG) << "realign: out in " << t_out * 1000 << " ms, in_[0] heard in " << t_in * 1000 << " ms, input " << in_.size() * 1000. / in_rate_
+                        << " ms, position " << p << "\n";
+    if (p < HALF)
     {
-        auto n = std::min<size_t>(static_cast<size_t>(skip), in_.size());
-        in_.erase(in_.begin(), in_.begin() + static_cast<long>(n));
-        in_time_ += chrono::duration_cast<clock::duration>(chrono::duration<double>(static_cast<double>(n) / in_rate_));
-        if (n < static_cast<size_t>(skip))
-            return; // not enough input yet, try again with the next blocks
+        // that frame is still in the future of our input: wait with silence
+        auto pad = static_cast<size_t>(std::ceil((HALF - p) * settings_.rate / in_rate_));
+        if (pad > settings_.rate)
+            return; // more than 1 s ahead: wait for the queue instead
+        writeSilence(pad);
+        p += static_cast<double>(pad) * in_rate_ / settings_.rate;
     }
-    else
+    if (p + HALF >= static_cast<double>(in_.size()))
     {
-        // input is ahead: pad the reference with silence
-        auto pad = static_cast<size_t>(-skip * settings_.rate / in_rate_);
-        writeSilence(std::min<size_t>(pad, settings_.rate)); // at most 1 s
+        // behind our input: keep only the history and try again with the next blocks
+        if (in_.size() > static_cast<size_t>(TAPS))
+        {
+            size_t n = in_.size() - TAPS;
+            in_.erase(in_.begin(), in_.begin() + static_cast<long>(n));
+            in_time_ += duration(static_cast<double>(n) / in_rate_);
+        }
+        return;
     }
+    pos_ = p;
     aligned_ = true;
-    LOG(INFO, LOG_TAG) << "Aligned (skip " << static_cast<long>(skip) << " input frames, delay " << delay << ")\n";
+    fine_pending_ = (delay == 0); // its real delay shows once it runs: align once more then
+    LOG(INFO, LOG_TAG) << "Aligned (position " << p << ", delay " << delay << ")\n";
 }
 
 
@@ -297,7 +330,7 @@ void RefOutput::logStats(clock::time_point now)
     if (now - last_stats_ < 60s)
         return;
     last_stats_ = now;
-    LOG(INFO, LOG_TAG) << "Stats: error " << err_avg_ * 1e6 << " us, ratio " << ratio_corr_ * 1e6 << " ppm, realigns " << realigns_ << ", xruns " << xruns_
+    LOG(INFO, LOG_TAG) << "Stats: error " << err_avg_ * 1e6 << " us, rate " << ratio_corr_ * 1e6 << " ppm, realigns " << realigns_ << ", xruns " << xruns_
                        << "\n";
 }
 
@@ -307,30 +340,33 @@ void RefOutput::worker()
     std::vector<float> out;
     while (active_)
     {
-        // collect new blocks
         std::deque<Block> blocks;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, 10ms, [this] { return !queue_.empty() || !active_; });
+            cv_.wait_for(lock, aligned_ ? 2ms : 10ms, [this] { return !queue_.empty() || !active_; });
             blocks.swap(queue_);
         }
         auto now = clock::now();
         for (auto& b : blocks)
         {
-            if (soxr_ == nullptr || b.rate != in_rate_)
+            if (b.rate != in_rate_)
+                resetInput(b.rate);
+            auto expected = in_time_ + duration(static_cast<double>(in_.size()) / in_rate_);
+            double dev = seconds(b.play_time - expected);
+            if (in_.empty() || std::abs(dev) > 0.015 || now - last_data_ > 100ms)
             {
-                resetResampler(b.rate);
-                in_.clear();
+                // start, gap or real jump in the main output: restart the timeline at this block
+                if (!in_.empty())
+                    LOG(DEBUG, LOG_TAG) << "Main output jumped by " << dev * 1000 << " ms\n";
+                in_.assign(HALF, 0.f); // history for the filter
+                in_time_ = b.play_time - duration(static_cast<double>(HALF) / in_rate_);
                 aligned_ = false;
             }
-            auto expected = in_time_ + chrono::duration_cast<clock::duration>(chrono::duration<double>(static_cast<double>(in_.size()) / in_rate_));
-            if (in_.empty() || std::abs(seconds(b.play_time - expected)) > 0.002)
+            else
             {
-                // gap or jump in the main output: restart the timeline at this block
-                if (!in_.empty())
-                    aligned_ = false;
-                in_.clear();
-                in_time_ = b.play_time;
+                // the block times come from the main device's delay readings and jitter by a few ms:
+                // follow them slowly (time constant ~2 s at 20 ms blocks)
+                in_time_ += duration(0.01 * dev);
             }
             in_.insert(in_.end(), b.samples.begin(), b.samples.end());
             last_data_ = now;
@@ -338,7 +374,7 @@ void RefOutput::worker()
 
         if (pcm_ == nullptr)
         {
-            if (!in_.empty() && soxr_ != nullptr && !openPcm())
+            if (in_.size() > static_cast<size_t>(TAPS) && !openPcm())
             {
                 in_.clear();
                 std::this_thread::sleep_for(1s);
@@ -373,77 +409,72 @@ void RefOutput::worker()
 
         if (!aligned_)
         {
-            if (in_.empty())
+            if (in_.size() > static_cast<size_t>(TAPS))
+                realign(now, delay);
+            if (!aligned_)
                 continue;
-            realign(now, delay);
-            continue;
         }
 
-        // How far off is the frame we write next?
-        double group = soxr_delay(soxr_) / settings_.rate;
-        double t_out = static_cast<double>(delay) / settings_.rate;              // from now until heard on the reference
-        double t_main = seconds(in_time_ - now) - group + seconds(settings_.offset); // same frame, wanted time
-        double err = t_out - t_main;                                             // > 0: reference late
+        // How far off is the frame we write next?  > 0: reference late
+        double t_out = static_cast<double>(delay) / settings_.rate;
+        double t_want = seconds(in_time_ - now) + pos_ / in_rate_ + seconds(settings_.offset);
+        double err = t_out - t_want;
+        if (fine_pending_ && snd_pcm_state(pcm_) == SND_PCM_STATE_RUNNING && delay > 0)
+        {
+            fine_pending_ = false;
+            if (std::abs(err) > 0.0003)
+            {
+                LOG(INFO, LOG_TAG) << "Device running, error " << err * 1000 << " ms, aligning once more\n";
+                aligned_ = false;
+                continue;
+            }
+        }
         if (std::abs(err) > seconds(settings_.max_error))
         {
             LOG(INFO, LOG_TAG) << "Error " << err * 1000 << " ms, realigning\n";
             aligned_ = false;
             continue;
         }
+        // first 20 s after aligning: 10x faster, to learn the clock difference within seconds
+        const double gain = (now - aligned_at_ < 20s) ? 10.0 : 1.0;
         err_avg_ += ERR_SMOOTH * (err - err_avg_);
-        integral_ = std::clamp(integral_ + err_avg_ * 0.01, -MAX_CORR / KI, MAX_CORR / KI);
-        // > 0: reference late, consume input faster
-        ratio_corr_ = std::clamp(KP * err_avg_ + KI * integral_, -MAX_CORR, MAX_CORR);
+        integral_ = std::clamp(integral_ + gain * err_avg_ * 0.01, -MAX_CORR / KI, MAX_CORR / KI);
+        ratio_corr_ = std::clamp(gain * KP * err_avg_ + KI * integral_, -MAX_CORR, MAX_CORR);
+        const double step = static_cast<double>(in_rate_) / settings_.rate * (1.0 + ratio_corr_);
 
-        // keep the device about half full
-        auto target = static_cast<snd_pcm_sframes_t>(settings_.rate * seconds(settings_.buffer) / 2);
+        // keep the device three quarters full
+        auto target = static_cast<snd_pcm_sframes_t>(settings_.rate * seconds(settings_.buffer) * 3 / 4);
         snd_pcm_sframes_t want = std::min(avail, std::max<snd_pcm_sframes_t>(0, target - delay));
         if (want <= 0)
         {
-            snd_pcm_wait(pcm_, 10);
+            snd_pcm_wait(pcm_, 2);
             logStats(now);
             continue;
         }
-        if (in_.empty())
-        {
-            // main output delivered nothing (yet): keep the device running, realign once data is back
-            writeSilence(static_cast<size_t>(want));
-            aligned_ = false;
-            continue;
-        }
         out.resize(static_cast<size_t>(want));
-        size_t idone = 0, odone = 0;
-        // only as much input as this block needs, so little waits inside the resampler
-        size_t in_len = std::min(in_.size(), static_cast<size_t>(want * (static_cast<double>(in_rate_) / settings_.rate)) + 16);
-        // drift: drop (late) or repeat (early) single input frames, at the rate the controller asks for
-        acc_ += ratio_corr_ * static_cast<double>(in_len);
-        while (acc_ >= 1.0 && in_.size() > 2)
+        size_t n = 0;
+        while (n < out.size() && pos_ + HALF < static_cast<double>(in_.size()))
         {
-            in_[1] = 0.5f * (in_[0] + in_[1]);
-            in_.erase(in_.begin());
-            in_time_ += chrono::duration_cast<clock::duration>(chrono::duration<double>(1.0 / in_rate_));
-            acc_ -= 1.0;
-            ++dropped_;
+            out[n++] = sample(pos_);
+            pos_ += step;
         }
-        while (acc_ <= -1.0 && !in_.empty())
+        if (n == 0)
         {
-            in_.insert(in_.begin(), in_[0]);
-            in_time_ -= chrono::duration_cast<clock::duration>(chrono::duration<double>(1.0 / in_rate_));
-            acc_ += 1.0;
-            ++repeated_;
-        }
-        in_len = std::min(in_len, in_.size());
-        soxr_error_t e = soxr_process(soxr_, in_.data(), in_len, &idone, out.data(), out.size(), &odone);
-        if (e != nullptr)
-        {
-            LOG(ERROR, LOG_TAG) << "soxr_process: " << e << "\n";
-            aligned_ = false;
+            // main output delivered nothing (yet): keep the device running; realign only after a real gap
+            writeSilence(static_cast<size_t>(want));
+            if (now - last_data_ > 200ms)
+                aligned_ = false;
             continue;
         }
-        in_.erase(in_.begin(), in_.begin() + static_cast<long>(idone));
-        in_time_ += chrono::duration_cast<clock::duration>(chrono::duration<double>(static_cast<double>(idone) / in_rate_));
-        if (odone > 0)
-            writeOutput(out, odone);
+        writeOutput(out, n);
+        // drop consumed input, keep the filter history
+        auto consumed = static_cast<long>(std::floor(pos_)) - HALF;
+        if (consumed > 4096)
+        {
+            in_.erase(in_.begin(), in_.begin() + consumed);
+            pos_ -= static_cast<double>(consumed);
+            in_time_ += duration(static_cast<double>(consumed) / in_rate_);
+        }
         logStats(now);
     }
 }

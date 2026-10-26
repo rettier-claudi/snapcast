@@ -155,7 +155,7 @@ int main(int argc, char** argv)
         op.add<Value<uint32_t>>("", "ref-rate", "sample rate of the reference output", 16000, &settings.player.reference.rate);
         op.add<Value<uint32_t>>("", "ref-channels", "channels of the reference output (all get the mono mix)", 2, &settings.player.reference.channels);
         op.add<Value<int>>("", "ref-offset", "reference is heard this many microseconds after the main output", 0, &settings.player.reference.offset_us);
-        op.add<Value<int>>("", "ref-buffer", "ALSA buffer of the reference output in ms", 60, &settings.player.reference.buffer_ms);
+        op.add<Value<int>>("", "ref-buffer", "ALSA buffer of the reference output in ms", 40, &settings.player.reference.buffer_ms);
 #endif
 
         auto supported_players = Controller::getSupportedPlayerNames();
