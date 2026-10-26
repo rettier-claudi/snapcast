@@ -47,9 +47,10 @@ namespace player
 /// fixed time offset, instead of syncing to the server on its own. The main
 /// player hands over each block together with the time its first sample is
 /// heard. A worker thread writes the blocks to the reference device, converts
-/// to its rate with a variable-rate resampler (soxr) and steers that rate so the
-/// reference stays at "main output time + offset". Two sound cards on different
-/// clocks are fine; on the same clock the ratio settles at nominal.
+/// to its rate with soxr (fixed ratio, constant delay) and keeps the reference at
+/// "main output time + offset" by dropping or repeating single input frames at the
+/// rate a PI controller asks for. Two sound cards on different clocks are fine; on
+/// the same clock nothing is dropped.
 class RefOutput
 {
 public:
@@ -109,6 +110,9 @@ private:
     double integral_{0.0};
     double ratio_corr_{0.0};
     double err_avg_{0.0};
+    double acc_{0.0};
+    size_t dropped_{0};
+    size_t repeated_{0};
     clock::time_point last_data_;
     clock::time_point last_stats_;
     size_t realigns_{0};

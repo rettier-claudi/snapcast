@@ -37,8 +37,9 @@ static constexpr auto LOG_TAG = "RefOutput";
 
 namespace
 {
-// Rate control: error in seconds -> relative ratio correction. Time constant ~10 s,
-// so a sound card 140 ppm off is caught within seconds and period jitter stays out.
+// Rate control: error in seconds -> relative rate correction, applied by dropping or
+// repeating input frames. Time constant ~10 s: a card 140 ppm off is caught, period
+// jitter of the delay readings stays out.
 constexpr double KP = 0.05;
 constexpr double KI = 0.005;
 constexpr double MAX_CORR = 1e-3;   // +-1000 ppm
@@ -199,9 +200,10 @@ void RefOutput::resetResampler(uint32_t in_rate)
     if (soxr_ != nullptr)
         soxr_delete(soxr_);
     soxr_error_t error;
-    soxr_quality_spec_t q = soxr_quality_spec(SOXR_HQ, SOXR_VR);
+    // fixed ratio: its delay is constant and reported exactly by soxr_delay, the drift is
+    // handled by dropping or repeating single input frames (see worker)
+    soxr_quality_spec_t q = soxr_quality_spec(SOXR_HQ, 0);
     soxr_io_spec_t io = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
-    // variable rate: rates given as the maximum ratio range, the actual ratio is set per call
     soxr_ = soxr_create(in_rate, settings_.rate, 1, &error, &io, &q, nullptr);
     if (error != nullptr)
     {
@@ -210,9 +212,9 @@ void RefOutput::resetResampler(uint32_t in_rate)
         return;
     }
     in_rate_ = in_rate;
-    soxr_set_io_ratio(soxr_, static_cast<double>(in_rate_) / settings_.rate, 0);
     integral_ = 0;
     ratio_corr_ = 0;
+    acc_ = 0;
 }
 
 
@@ -260,13 +262,11 @@ void RefOutput::realign(clock::time_point now, snd_pcm_sframes_t delay)
 {
     ++realigns_;
     if (soxr_ != nullptr)
-    {
         soxr_clear(soxr_);
-        soxr_set_io_ratio(soxr_, static_cast<double>(in_rate_) / settings_.rate, 0);
-    }
     integral_ = 0;
     ratio_corr_ = 0;
     err_avg_ = 0;
+    acc_ = 0;
     // the next written frame is heard at:
     auto t_out = now + chrono::duration_cast<clock::duration>(chrono::duration<double>(static_cast<double>(delay) / settings_.rate));
     // resampler group delay, in input time
@@ -392,9 +392,8 @@ void RefOutput::worker()
         }
         err_avg_ += ERR_SMOOTH * (err - err_avg_);
         integral_ = std::clamp(integral_ + err_avg_ * 0.01, -MAX_CORR / KI, MAX_CORR / KI);
+        // > 0: reference late, consume input faster
         ratio_corr_ = std::clamp(KP * err_avg_ + KI * integral_, -MAX_CORR, MAX_CORR);
-        // late -> eat input faster
-        soxr_set_io_ratio(soxr_, static_cast<double>(in_rate_) / settings_.rate * (1.0 + ratio_corr_), 0);
 
         // keep the device about half full
         auto target = static_cast<snd_pcm_sframes_t>(settings_.rate * seconds(settings_.buffer) / 2);
@@ -415,7 +414,25 @@ void RefOutput::worker()
         out.resize(static_cast<size_t>(want));
         size_t idone = 0, odone = 0;
         // only as much input as this block needs, so little waits inside the resampler
-        size_t in_len = std::min(in_.size(), static_cast<size_t>(want * (static_cast<double>(in_rate_) / settings_.rate) * (1.0 + ratio_corr_)) + 16);
+        size_t in_len = std::min(in_.size(), static_cast<size_t>(want * (static_cast<double>(in_rate_) / settings_.rate)) + 16);
+        // drift: drop (late) or repeat (early) single input frames, at the rate the controller asks for
+        acc_ += ratio_corr_ * static_cast<double>(in_len);
+        while (acc_ >= 1.0 && in_.size() > 2)
+        {
+            in_[1] = 0.5f * (in_[0] + in_[1]);
+            in_.erase(in_.begin());
+            in_time_ += chrono::duration_cast<clock::duration>(chrono::duration<double>(1.0 / in_rate_));
+            acc_ -= 1.0;
+            ++dropped_;
+        }
+        while (acc_ <= -1.0 && !in_.empty())
+        {
+            in_.insert(in_.begin(), in_[0]);
+            in_time_ -= chrono::duration_cast<clock::duration>(chrono::duration<double>(1.0 / in_rate_));
+            acc_ += 1.0;
+            ++repeated_;
+        }
+        in_len = std::min(in_len, in_.size());
         soxr_error_t e = soxr_process(soxr_, in_.data(), in_len, &idone, out.data(), out.size(), &odone);
         if (e != nullptr)
         {
