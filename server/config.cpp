@@ -27,10 +27,12 @@
 
 // standard headers
 #include <cerrno>
+#include <cstdio>
 #include <fcntl.h>
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 using namespace std;
 
@@ -122,11 +124,39 @@ void Config::save()
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (filename_.empty())
         init();
-    std::ofstream ofs(filename_.c_str(), std::ofstream::out | std::ofstream::trunc);
+    // Write to a temporary file, fsync it and rename it over the settings file, so that a crash or
+    // power loss never leaves a truncated or empty server.json behind. An empty file is silently
+    // treated as "no settings" by init(), which resets all clients to their defaults.
     json clients = {{"ConfigVersion", 2}, {"Groups", getGroupsJson()}};
+    const std::string tmp_filename = filename_ + ".tmp";
+    std::ofstream ofs(tmp_filename.c_str(), std::ofstream::out | std::ofstream::trunc);
     // ofs << std::setw(4) << clients;
     ofs << clients;
     ofs.close();
+    if (!ofs)
+    {
+        LOG(ERROR) << "Failed to write settings file: \"" << tmp_filename << "\"\n";
+        return;
+    }
+    int fd = open(tmp_filename.c_str(), O_RDONLY);
+    if (fd != -1)
+    {
+        fsync(fd);
+        close(fd);
+    }
+    if (rename(tmp_filename.c_str(), filename_.c_str()) != 0)
+    {
+        LOG(ERROR) << "Failed to rename \"" << tmp_filename << "\" to \"" << filename_ << "\", error: " << errno << "\n";
+        return;
+    }
+    // Persist the rename itself
+    size_t slash = filename_.find_last_of('/');
+    std::string dir = (slash == std::string::npos) ? "." : filename_.substr(0, slash);
+    if ((fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY)) != -1)
+    {
+        fsync(fd);
+        close(fd);
+    }
 }
 
 
